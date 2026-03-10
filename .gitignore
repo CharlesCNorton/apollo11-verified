@@ -1,0 +1,11 @@
+# Coq and Rocq build products.
+*.vo
+*.vos
+*.vok
+*.vio
+*.glob
+*.aux
+
+# Native compilation artifacts.
+.coq-native/
+lia.cache
