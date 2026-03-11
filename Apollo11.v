@@ -756,3 +756,401 @@ Lemma two_phase_advances_from_p63_enter_vertical_p65 :
 Proof.
   reflexivity.
 Qed.
+
+(** * Alarm Register Model *)
+
+(**
+  The Apollo 11 alarm handler does not maintain an unbounded list.  It probes
+  `FAILREG`, then `FAILREG + 1`, then `FAILREG + 2`, and if all three are
+  occupied it records overflow information in the final register while leaving
+  the earlier slots intact.  We model that fixed-capacity structure directly.
+*)
+Record fail_registers : Type := {
+  failreg_1 : option alarm_code;
+  failreg_2 : option alarm_code;
+  failreg_3 : option alarm_code;
+  failreg_overflow : bool;
+  program_alarm_light : bool
+}.
+
+(** Empty alarm state before any non-abortive alarm has been recorded. *)
+Definition empty_fail_registers : fail_registers :=
+  {|
+    failreg_1 := None;
+    failreg_2 := None;
+    failreg_3 := None;
+    failreg_overflow := false;
+    program_alarm_light := false
+  |}.
+
+(** Count the number of occupied alarm slots. *)
+Definition slot_count (slot : option alarm_code) : nat :=
+  match slot with
+  | None => 0
+  | Some _ => 1
+  end.
+
+Definition occupied_fail_slots (registers : fail_registers) : nat :=
+  slot_count (failreg_1 registers) +
+  slot_count (failreg_2 registers) +
+  slot_count (failreg_3 registers).
+
+(** All three fixed alarm slots are in use. *)
+Definition fail_registers_full (registers : fail_registers) : Prop :=
+  occupied_fail_slots registers = 3.
+
+(**
+  This is the executable non-abortive alarm insertion policy from the source:
+
+  - if `FAILREG` is empty, store there and turn on the program alarm light
+  - else if `FAILREG + 1` is empty, store there
+  - else if `FAILREG + 2` is empty, store there
+  - else preserve the slots and set the overflow bit
+*)
+Definition record_alarm
+    (code : alarm_code) (registers : fail_registers) : fail_registers :=
+  match failreg_1 registers with
+  | None =>
+      {|
+        failreg_1 := Some code;
+        failreg_2 := failreg_2 registers;
+        failreg_3 := failreg_3 registers;
+        failreg_overflow := failreg_overflow registers;
+        program_alarm_light := true
+      |}
+  | Some _ =>
+      match failreg_2 registers with
+      | None =>
+          {|
+            failreg_1 := failreg_1 registers;
+            failreg_2 := Some code;
+            failreg_3 := failreg_3 registers;
+            failreg_overflow := failreg_overflow registers;
+            program_alarm_light := true
+          |}
+      | Some _ =>
+          match failreg_3 registers with
+          | None =>
+              {|
+                failreg_1 := failreg_1 registers;
+                failreg_2 := failreg_2 registers;
+                failreg_3 := Some code;
+                failreg_overflow := failreg_overflow registers;
+                program_alarm_light := true
+              |}
+          | Some _ =>
+              {|
+                failreg_1 := failreg_1 registers;
+                failreg_2 := failreg_2 registers;
+                failreg_3 := failreg_3 registers;
+                failreg_overflow := true;
+                program_alarm_light := true
+              |}
+          end
+      end
+  end.
+
+(** Once an alarm is recorded, the program alarm light is on. *)
+Lemma record_alarm_turns_on_program_alarm_light :
+  forall (code : alarm_code) (registers : fail_registers),
+    program_alarm_light (record_alarm code registers) = true.
+Proof.
+  intros code registers.
+  unfold record_alarm.
+  destruct (failreg_1 registers) as [slot1 |];
+    destruct (failreg_2 registers) as [slot2 |];
+    destruct (failreg_3 registers) as [slot3 |];
+    reflexivity.
+Qed.
+
+(**
+  Recording an alarm can never create more than three occupied slots, because
+  the underlying machine only has three fail registers.
+*)
+Lemma occupied_fail_slots_le_3 :
+  forall (registers : fail_registers),
+    occupied_fail_slots registers <= 3.
+Proof.
+  intros registers.
+  unfold occupied_fail_slots, slot_count.
+  destruct (failreg_1 registers), (failreg_2 registers), (failreg_3 registers);
+    simpl; lia.
+Qed.
+
+(**
+  Recording an alarm preserves the global capacity bound.  This is the first
+  real safety property for the fail-register subsystem.
+*)
+Lemma record_alarm_preserves_capacity :
+  forall (code : alarm_code) (registers : fail_registers),
+    occupied_fail_slots (record_alarm code registers) <= 3.
+Proof.
+  intros code registers.
+  apply occupied_fail_slots_le_3.
+Qed.
+
+(**
+  If there is at least one free slot, recording an alarm consumes exactly one
+  slot.  This matches the sequential search through `FAILREG`, `FAILREG+1`, and
+  `FAILREG+2` in the source.
+*)
+Lemma record_alarm_increases_occupied_slots_when_not_full :
+  forall (code : alarm_code) (registers : fail_registers),
+    occupied_fail_slots registers < 3 ->
+    occupied_fail_slots (record_alarm code registers) =
+    S (occupied_fail_slots registers).
+Proof.
+  intros code registers Hnot_full.
+  unfold occupied_fail_slots, slot_count in *.
+  unfold record_alarm.
+  destruct (failreg_1 registers) as [slot1 |];
+    destruct (failreg_2 registers) as [slot2 |];
+    destruct (failreg_3 registers) as [slot3 |];
+    simpl in *; lia.
+Qed.
+
+(**
+  If all fail registers are already occupied, a new alarm cannot consume a new
+  slot.  The concrete handler instead sets overflow state in the third register.
+*)
+Lemma record_alarm_sets_overflow_when_full :
+  forall (code : alarm_code) (registers : fail_registers),
+    fail_registers_full registers ->
+    failreg_overflow (record_alarm code registers) = true /\
+    occupied_fail_slots (record_alarm code registers) =
+    occupied_fail_slots registers.
+Proof.
+  intros code [slot1 slot2 slot3 overflow light] Hfull.
+  unfold fail_registers_full in Hfull.
+  unfold occupied_fail_slots, slot_count in Hfull.
+  unfold record_alarm.
+  simpl in *.
+  destruct slot1 as [alarm1 |];
+    destruct slot2 as [alarm2 |];
+    destruct slot3 as [alarm3 |];
+    simpl in *; try lia.
+  split; reflexivity.
+Qed.
+
+(**
+  Before the fail registers are full, overflow is not introduced by recording a
+  new non-abortive alarm.  This matches the source's control flow, which only
+  reaches `MULTFAIL` after all three slots are already occupied.
+*)
+Lemma record_alarm_preserves_non_overflow_when_not_full :
+  forall (code : alarm_code) (registers : fail_registers),
+    occupied_fail_slots registers < 3 ->
+    failreg_overflow (record_alarm code registers) = failreg_overflow registers.
+Proof.
+  intros code registers Hnot_full.
+  unfold occupied_fail_slots, slot_count in Hnot_full.
+  unfold record_alarm.
+  destruct (failreg_1 registers) as [slot1 |];
+    destruct (failreg_2 registers) as [slot2 |];
+    destruct (failreg_3 registers) as [slot3 |];
+    simpl in *; try lia; reflexivity.
+Qed.
+
+(**
+  The first alarm lands in `FAILREG`, just as the source takes the `PROGLARM`
+  path immediately when the first register is empty.
+*)
+Lemma first_alarm_occupies_failreg_1 :
+  forall (code : alarm_code),
+    failreg_1 (record_alarm code empty_fail_registers) = Some code /\
+    occupied_fail_slots (record_alarm code empty_fail_registers) = 1.
+Proof.
+  intros code.
+  split; reflexivity.
+Qed.
+
+(** * Composed LM Descent Control State *)
+
+(**
+  To move beyond isolated subsystems, we compose the landing-mode controller,
+  executive ready queue, and fail-register alarms into a single LM descent
+  control state.  This is still far from the full AGC machine, but it is an
+  honest operational interface between multiple source-grounded components.
+*)
+Record lm_descent_state : Type := {
+  lm_landing_program : landing_program;
+  lm_ready_queue : list job;
+  lm_fail_registers : fail_registers
+}.
+
+(** The initial composed state starts in braking with empty queue and alarms. *)
+Definition initial_lm_descent_state : lm_descent_state :=
+  {|
+    lm_landing_program := P63;
+    lm_ready_queue := [];
+    lm_fail_registers := empty_fail_registers
+  |}.
+
+(**
+  The composed state invariant bundles the strongest proved safety facts we have
+  so far for the participating subsystems.
+*)
+Definition lm_descent_state_ok (state : lm_descent_state) : Prop :=
+  ready_queue_ok (lm_ready_queue state) /\
+  occupied_fail_slots (lm_fail_registers state) <= 3.
+
+(**
+  Events for the composed state are deliberately sourced from the Apollo 11
+  code organization:
+
+  - executive queue events from `EXECUTIVE.agc`
+  - landing phase advancement from the `NEWPHASE` table
+  - vertical controller updates from GUILDENSTERN
+  - alarm recording from `ALARM_AND_ABORT.agc`
+*)
+Inductive lm_event : Type :=
+| SubmitReadyJob (job_to_submit : job)
+| WakeSleepingJob (job_to_wake : job)
+| AdvanceLandingPhase
+| ApplyGuildensternInputs (inputs : guildenstern_inputs)
+| RecordProgramAlarm (code : alarm_code).
+
+(** Small-step event application for the composed LM descent controller. *)
+Definition apply_lm_event (event : lm_event) (state : lm_descent_state)
+    : lm_descent_state :=
+  match event with
+  | SubmitReadyJob job_to_submit =>
+      {|
+        lm_landing_program := lm_landing_program state;
+        lm_ready_queue := submit_job job_to_submit (lm_ready_queue state);
+        lm_fail_registers := lm_fail_registers state
+      |}
+  | WakeSleepingJob job_to_wake =>
+      {|
+        lm_landing_program := lm_landing_program state;
+        lm_ready_queue := wake_job job_to_wake (lm_ready_queue state);
+        lm_fail_registers := lm_fail_registers state
+      |}
+  | AdvanceLandingPhase =>
+      {|
+        lm_landing_program := advance_landing_program (lm_landing_program state);
+        lm_ready_queue := lm_ready_queue state;
+        lm_fail_registers := lm_fail_registers state
+      |}
+  | ApplyGuildensternInputs inputs =>
+      {|
+        lm_landing_program :=
+          apply_guildenstern (lm_landing_program state) inputs;
+        lm_ready_queue := lm_ready_queue state;
+        lm_fail_registers := lm_fail_registers state
+      |}
+  | RecordProgramAlarm code =>
+      {|
+        lm_landing_program := lm_landing_program state;
+        lm_ready_queue := lm_ready_queue state;
+        lm_fail_registers := record_alarm code (lm_fail_registers state)
+      |}
+  end.
+
+(** The initial composed state satisfies the invariant. *)
+Lemma initial_lm_descent_state_ok :
+  lm_descent_state_ok initial_lm_descent_state.
+Proof.
+  split.
+  - unfold initial_lm_descent_state, ready_queue_ok.
+    constructor.
+  - unfold initial_lm_descent_state, occupied_fail_slots, slot_count.
+    simpl.
+    lia.
+Qed.
+
+(**
+  Every event we currently model preserves the combined safety invariant.  This
+  is the first theorem that actually links the subsystem semantics together.
+*)
+Lemma apply_lm_event_preserves_state_ok :
+  forall (event : lm_event) (state : lm_descent_state),
+    lm_descent_state_ok state ->
+    lm_descent_state_ok (apply_lm_event event state).
+Proof.
+  intros event state [Hqueue Hfail].
+  destruct event as [job_to_submit | job_to_wake | | inputs | code]; simpl.
+  - split.
+    + apply submit_job_preserves_ready_queue.
+      exact Hqueue.
+    + exact Hfail.
+  - split.
+    + apply wake_job_preserves_ready_queue.
+      exact Hqueue.
+    + exact Hfail.
+  - split.
+    + exact Hqueue.
+    + exact Hfail.
+  - split.
+    + exact Hqueue.
+    + exact Hfail.
+  - split.
+    + exact Hqueue.
+    + apply record_alarm_preserves_capacity.
+Qed.
+
+(**
+  GUILDENSTERN remains phase-preserving even after embedding it into the
+  composed LM descent state.
+*)
+Lemma apply_guildenstern_event_preserves_phase :
+  forall (state : lm_descent_state) (inputs : guildenstern_inputs),
+    landing_phase_of_program
+      (lm_landing_program (apply_lm_event (ApplyGuildensternInputs inputs) state)) =
+    landing_phase_of_program (lm_landing_program state).
+Proof.
+  intros state inputs.
+  simpl.
+  apply apply_guildenstern_preserves_landing_phase.
+Qed.
+
+(**
+  The explicit phase-advance event remains monotone after composition.
+*)
+Lemma advance_landing_phase_event_is_monotone :
+  forall (state : lm_descent_state),
+    landing_phase_rank (landing_phase_of_program (lm_landing_program state)) <=
+    landing_phase_rank
+      (landing_phase_of_program
+         (lm_landing_program (apply_lm_event AdvanceLandingPhase state))).
+Proof.
+  intros state.
+  simpl.
+  apply advance_landing_program_is_monotone.
+Qed.
+
+(**
+  A concrete composed-state trace: four program alarms from the empty state fill
+  the three fail registers and force overflow on the fourth alarm.
+*)
+Lemma fourth_alarm_from_empty_sets_overflow :
+  forall (code1 code2 code3 code4 : alarm_code),
+    failreg_overflow
+      (lm_fail_registers
+         (apply_lm_event (RecordProgramAlarm code4)
+            (apply_lm_event (RecordProgramAlarm code3)
+               (apply_lm_event (RecordProgramAlarm code2)
+                  (apply_lm_event (RecordProgramAlarm code1)
+                     initial_lm_descent_state))))) = true.
+Proof.
+  intros code1 code2 code3 code4.
+  reflexivity.
+Qed.
+
+(**
+  The same four-alarm trace saturates, but does not exceed, the three concrete
+  fail-register slots.
+*)
+Lemma fourth_alarm_from_empty_saturates_capacity :
+  forall (code1 code2 code3 code4 : alarm_code),
+    occupied_fail_slots
+      (lm_fail_registers
+         (apply_lm_event (RecordProgramAlarm code4)
+            (apply_lm_event (RecordProgramAlarm code3)
+               (apply_lm_event (RecordProgramAlarm code2)
+                  (apply_lm_event (RecordProgramAlarm code1)
+                     initial_lm_descent_state))))) = 3.
+Proof.
+  intros code1 code2 code3 code4.
+  reflexivity.
+Qed.
