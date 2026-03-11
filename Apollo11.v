@@ -1154,3 +1154,249 @@ Proof.
   intros code1 code2 code3 code4.
   reflexivity.
 Qed.
+
+(** * Command Module Entry DAP Control *)
+
+(**
+  The Comanche entry DAP logic around `READGYMB` and `DOBRATE?` is governed by
+  a small number of discrete conditions:
+
+  - whether DAP standby/arming is enabled (`CM/DSTBY`)
+  - whether this is the first pass after initialization (`GYMDIFSW`)
+  - whether the CDU is in fine-align mode
+
+  The source then branches between body-rate computation, first-pass
+  initialization, and DAP termination.
+*)
+Record cm_dap_inputs : Type := {
+  cm_dstby_enabled : bool;
+  cm_gymdifsw_enabled : bool;
+  cdu_in_fine_align : bool
+}.
+
+(**
+  We expose the branch outcomes directly.  This matches the source comments more
+  closely than a coarser boolean model would.
+*)
+Inductive cm_dap_outcome : Type :=
+| ContinueWithBodyRate
+| ContinueFirstPassInitialization
+| TerminateDapAndFlushJets
+| IdleDueToFineAlign.
+
+(**
+  This is the abstract control semantics of `READGYMB` and `DOBRATE?`:
+
+  - fine align prevents normal gimbal-difference processing and idles the DAP
+  - if DAP standby is disabled, the DAP flushes jets and terminates group 6
+  - if standby is enabled but `GYMDIFSW` is not yet set, the first pass
+    initializes state but does not compute body rate
+  - otherwise body-rate computation proceeds
+*)
+Definition cm_entry_dap_step (inputs : cm_dap_inputs) : cm_dap_outcome :=
+  if cdu_in_fine_align inputs then IdleDueToFineAlign
+  else if cm_dstby_enabled inputs then
+         if cm_gymdifsw_enabled inputs
+         then ContinueWithBodyRate
+         else ContinueFirstPassInitialization
+       else TerminateDapAndFlushJets.
+
+(**
+  The DAP state records exactly the pieces of abstract control state needed for
+  these branch conditions and their effects.
+*)
+Record cm_dap_state : Type := {
+  cm_dap_armed : bool;
+  cm_gymdifsw_state : bool;
+  cm_jets_firing : bool;
+  cm_group_6_active : bool;
+  cm_body_rate_valid : bool
+}.
+
+(** A conservative initial state before the entry DAP is armed. *)
+Definition initial_cm_dap_state : cm_dap_state :=
+  {|
+    cm_dap_armed := false;
+    cm_gymdifsw_state := false;
+    cm_jets_firing := false;
+    cm_group_6_active := false;
+    cm_body_rate_valid := false
+  |}.
+
+(**
+  Applying one DAP control step updates the abstract state according to the
+  control branch selected above.
+*)
+Definition apply_cm_dap_step
+    (inputs : cm_dap_inputs) (state : cm_dap_state) : cm_dap_state :=
+  match cm_entry_dap_step inputs with
+  | IdleDueToFineAlign =>
+      {|
+        cm_dap_armed := cm_dap_armed state;
+        cm_gymdifsw_state := false;
+        cm_jets_firing := false;
+        cm_group_6_active := cm_group_6_active state;
+        cm_body_rate_valid := cm_body_rate_valid state
+      |}
+  | ContinueFirstPassInitialization =>
+      {|
+        cm_dap_armed := true;
+        cm_gymdifsw_state := true;
+        cm_jets_firing := cm_jets_firing state;
+        cm_group_6_active := true;
+        cm_body_rate_valid := false
+      |}
+  | ContinueWithBodyRate =>
+      {|
+        cm_dap_armed := true;
+        cm_gymdifsw_state := true;
+        cm_jets_firing := cm_jets_firing state;
+        cm_group_6_active := true;
+        cm_body_rate_valid := true
+      |}
+  | TerminateDapAndFlushJets =>
+      {|
+        cm_dap_armed := false;
+        cm_gymdifsw_state := false;
+        cm_jets_firing := false;
+        cm_group_6_active := false;
+        cm_body_rate_valid := false
+      |}
+  end.
+
+(**
+  Fine-align mode prevents the DAP from using the current gimbal pass for body
+  rate.  This reflects the early `READGYMB` branch.
+*)
+Lemma fine_align_forces_idle :
+  forall (inputs : cm_dap_inputs),
+    cdu_in_fine_align inputs = true ->
+    cm_entry_dap_step inputs = IdleDueToFineAlign.
+Proof.
+  intros inputs Hfine.
+  unfold cm_entry_dap_step.
+  rewrite Hfine.
+  reflexivity.
+Qed.
+
+(**
+  If standby is disabled and the CDU is not in fine-align mode, the DAP flushes
+  jets and terminates the active group, exactly as the `DOBRATE?` path does.
+*)
+Lemma standby_disabled_terminates_dap :
+  forall (inputs : cm_dap_inputs),
+    cdu_in_fine_align inputs = false ->
+    cm_dstby_enabled inputs = false ->
+    cm_entry_dap_step inputs = TerminateDapAndFlushJets.
+Proof.
+  intros inputs Hfine Hdstby.
+  unfold cm_entry_dap_step.
+  rewrite Hfine.
+  rewrite Hdstby.
+  reflexivity.
+Qed.
+
+(**
+  On the first armed pass, body rate is still not valid; the source explicitly
+  skips `BODYRATE` and only initializes the tracking state.
+*)
+Lemma first_armed_pass_initializes_without_body_rate :
+  forall (inputs : cm_dap_inputs),
+    cdu_in_fine_align inputs = false ->
+    cm_dstby_enabled inputs = true ->
+    cm_gymdifsw_enabled inputs = false ->
+    cm_entry_dap_step inputs = ContinueFirstPassInitialization.
+Proof.
+  intros inputs Hfine Hdstby Hgym.
+  unfold cm_entry_dap_step.
+  rewrite Hfine.
+  rewrite Hdstby.
+  rewrite Hgym.
+  reflexivity.
+Qed.
+
+(**
+  Once both standby and gimbal-difference state are enabled, the control path
+  reaches body-rate computation.
+*)
+Lemma armed_operational_pass_computes_body_rate :
+  forall (inputs : cm_dap_inputs),
+    cdu_in_fine_align inputs = false ->
+    cm_dstby_enabled inputs = true ->
+    cm_gymdifsw_enabled inputs = true ->
+    cm_entry_dap_step inputs = ContinueWithBodyRate.
+Proof.
+  intros inputs Hfine Hdstby Hgym.
+  unfold cm_entry_dap_step.
+  rewrite Hfine.
+  rewrite Hdstby.
+  rewrite Hgym.
+  reflexivity.
+Qed.
+
+(**
+  The termination branch really clears the operational DAP state.
+*)
+Lemma termination_step_clears_dap_activity :
+  forall (inputs : cm_dap_inputs) (state : cm_dap_state),
+    cm_entry_dap_step inputs = TerminateDapAndFlushJets ->
+    cm_dap_armed (apply_cm_dap_step inputs state) = false /\
+    cm_jets_firing (apply_cm_dap_step inputs state) = false /\
+    cm_group_6_active (apply_cm_dap_step inputs state) = false /\
+    cm_body_rate_valid (apply_cm_dap_step inputs state) = false.
+Proof.
+  intros inputs state Hstep.
+  unfold apply_cm_dap_step.
+  rewrite Hstep.
+  repeat split; reflexivity.
+Qed.
+
+(**
+  Fine-align idling clears gimbal-difference tracking and quenches jets without
+  destroying the rest of the state.
+*)
+Lemma fine_align_step_clears_gimbal_tracking :
+  forall (inputs : cm_dap_inputs) (state : cm_dap_state),
+    cm_entry_dap_step inputs = IdleDueToFineAlign ->
+    cm_gymdifsw_state (apply_cm_dap_step inputs state) = false /\
+    cm_jets_firing (apply_cm_dap_step inputs state) = false.
+Proof.
+  intros inputs state Hstep.
+  unfold apply_cm_dap_step.
+  rewrite Hstep.
+  split; reflexivity.
+Qed.
+
+(**
+  A first operational pass arms the DAP and activates group 6, but still leaves
+  body-rate validity false.
+*)
+Lemma first_pass_step_arms_without_rate_validity :
+  forall (inputs : cm_dap_inputs) (state : cm_dap_state),
+    cm_entry_dap_step inputs = ContinueFirstPassInitialization ->
+    cm_dap_armed (apply_cm_dap_step inputs state) = true /\
+    cm_group_6_active (apply_cm_dap_step inputs state) = true /\
+    cm_body_rate_valid (apply_cm_dap_step inputs state) = false.
+Proof.
+  intros inputs state Hstep.
+  unfold apply_cm_dap_step.
+  rewrite Hstep.
+  repeat split; reflexivity.
+Qed.
+
+(**
+  Once the control path reaches the operational branch, body-rate validity is
+  established and the DAP remains armed.
+*)
+Lemma operational_step_sets_body_rate_valid :
+  forall (inputs : cm_dap_inputs) (state : cm_dap_state),
+    cm_entry_dap_step inputs = ContinueWithBodyRate ->
+    cm_dap_armed (apply_cm_dap_step inputs state) = true /\
+    cm_group_6_active (apply_cm_dap_step inputs state) = true /\
+    cm_body_rate_valid (apply_cm_dap_step inputs state) = true.
+Proof.
+  intros inputs state Hstep.
+  unfold apply_cm_dap_step.
+  rewrite Hstep.
+  repeat split; reflexivity.
+Qed.
