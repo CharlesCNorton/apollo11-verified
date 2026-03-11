@@ -1400,3 +1400,1035 @@ Proof.
   rewrite Hstep.
   repeat split; reflexivity.
 Qed.
+
+(** * CM Reentry Control Model *)
+
+(**
+  `REENTRY_CONTROL.agc` is organized around a mutable selector, `GOTOADDR`,
+  whose contents determine the current roll-control phase.  The file-level
+  comments specify the high-level sequencing explicitly:
+
+  - `INITROLL` starts first and waits for threshold crossings
+  - `HUNTEST` compares predicted range against the desired range
+  - `UPCONTRL` governs the super-circular phase
+  - `KEP2` is the Kepler phase, but the source also allows a direct
+    `INITROLL -> KEP2` transfer on the pre-`.05G` path
+  - `PREDICT3` handles the final sub-orbital steering phase
+  - `P67.1` maintains the last roll command and waits for final display
+    acknowledgement
+
+  The model below keeps that selector-driven control structure explicit, rather
+  than collapsing reentry into a single undifferentiated state.
+*)
+Inductive reentry_selector : Type :=
+| ReentryInitRoll
+| ReentryHuntest
+| ReentryUpControl
+| ReentryKep2
+| ReentryPredict3
+| ReentryP67_1.
+
+(** A numeric ranking supports monotonicity proofs for reentry sequencing. *)
+Definition reentry_selector_rank (selector : reentry_selector) : nat :=
+  match selector with
+  | ReentryInitRoll => 0
+  | ReentryHuntest => 1
+  | ReentryUpControl => 2
+  | ReentryKep2 => 3
+  | ReentryPredict3 => 4
+  | ReentryP67_1 => 5
+  end.
+
+(**
+  These boolean observables summarize the source-level branch conditions that
+  drive `GOTOADDR` updates:
+
+  - `kat_exceeded_now` models the first `INITROLL` threshold
+  - `vrthresh_exceeded_now` models the second `INITROLL` threshold
+  - `direct_kepler_entry_now` captures the documented direct `INITROLL -> KEP2`
+    path used on the pre-`.05G` route
+  - `predicted_range_short_enough` determines whether `HUNTEST` transfers to
+    `UPCONTRL`
+  - `drag_above_lateral_threshold_now` approximates the `NOSWITCH` trigger in
+    `UPCONTRL`
+  - `drag_below_q7_now` models the `UPCONTRL -> KEP2` condition
+  - `rdot_negative_now` and `reference_vl_exceeds_v_now` model the alternate
+    `UPCONTRL -> PREDICT3` skip over Kepler
+  - `drag_exceeds_q7_margin_now` captures the `KEP2 -> PREDICT3` threshold
+  - `velocity_below_vquit_now` captures the `PREDICT3 -> P67.1` handoff
+  - `final_display_acknowledged_now` terminates entry from `P67.1`
+*)
+Record reentry_control_inputs : Type := {
+  kat_exceeded_now : bool;
+  vrthresh_exceeded_now : bool;
+  direct_kepler_entry_now : bool;
+  predicted_range_short_enough : bool;
+  drag_above_lateral_threshold_now : bool;
+  drag_below_q7_now : bool;
+  rdot_negative_now : bool;
+  reference_vl_exceeds_v_now : bool;
+  drag_exceeds_q7_margin_now : bool;
+  velocity_below_vquit_now : bool;
+  final_display_acknowledged_now : bool
+}.
+
+(**
+  The reentry control state tracks the selector together with a small amount of
+  persistent control information that the source comments make operationally
+  significant.
+*)
+Record reentry_control_state : Type := {
+  reentry_selector_state : reentry_selector;
+  reentry_kat_latched : bool;
+  reentry_roll_command_active : bool;
+  reentry_lateral_switch_inhibited : bool;
+  reentry_kepler_trim_active : bool;
+  reentry_steering_enabled : bool;
+  reentry_final_display_active : bool;
+  reentry_terminated : bool
+}.
+
+(** The initial selector is `INITROLL`, as set by `STARTENT`. *)
+Definition initial_reentry_control_state : reentry_control_state :=
+  {|
+    reentry_selector_state := ReentryInitRoll;
+    reentry_kat_latched := false;
+    reentry_roll_command_active := true;
+    reentry_lateral_switch_inhibited := false;
+    reentry_kepler_trim_active := false;
+    reentry_steering_enabled := true;
+    reentry_final_display_active := false;
+    reentry_terminated := false
+  |}.
+
+(**
+  One control step updates `GOTOADDR` and the associated abstract control state.
+  The transition structure follows the sequencing comments in
+  `REENTRY_CONTROL.agc`, while preserving the documented direct-entry exception
+  into `KEP2`.
+*)
+Definition apply_reentry_control_step
+    (inputs : reentry_control_inputs) (state : reentry_control_state)
+    : reentry_control_state :=
+  match reentry_selector_state state with
+  | ReentryInitRoll =>
+      if direct_kepler_entry_now inputs then
+        {|
+          reentry_selector_state := ReentryKep2;
+          reentry_kat_latched := true;
+          reentry_roll_command_active := false;
+          reentry_lateral_switch_inhibited :=
+            reentry_lateral_switch_inhibited state;
+          reentry_kepler_trim_active := true;
+          reentry_steering_enabled := true;
+          reentry_final_display_active := false;
+          reentry_terminated := false
+        |}
+      else if reentry_kat_latched state then
+             if vrthresh_exceeded_now inputs then
+               {|
+                 reentry_selector_state := ReentryHuntest;
+                 reentry_kat_latched := true;
+                 reentry_roll_command_active := true;
+                 reentry_lateral_switch_inhibited :=
+                   reentry_lateral_switch_inhibited state;
+                 reentry_kepler_trim_active := false;
+                 reentry_steering_enabled := true;
+                 reentry_final_display_active := false;
+                 reentry_terminated := false
+               |}
+             else
+               {|
+                 reentry_selector_state := ReentryInitRoll;
+                 reentry_kat_latched := true;
+                 reentry_roll_command_active := true;
+                 reentry_lateral_switch_inhibited :=
+                   reentry_lateral_switch_inhibited state;
+                 reentry_kepler_trim_active := false;
+                 reentry_steering_enabled := true;
+                 reentry_final_display_active := false;
+                 reentry_terminated := false
+               |}
+           else if kat_exceeded_now inputs then
+                  {|
+                    reentry_selector_state := ReentryInitRoll;
+                    reentry_kat_latched := true;
+                    reentry_roll_command_active := true;
+                    reentry_lateral_switch_inhibited :=
+                      reentry_lateral_switch_inhibited state;
+                    reentry_kepler_trim_active := false;
+                    reentry_steering_enabled := true;
+                    reentry_final_display_active := false;
+                    reentry_terminated := false
+                  |}
+                else
+                  {|
+                    reentry_selector_state := ReentryInitRoll;
+                    reentry_kat_latched := false;
+                    reentry_roll_command_active := true;
+                    reentry_lateral_switch_inhibited :=
+                      reentry_lateral_switch_inhibited state;
+                    reentry_kepler_trim_active := false;
+                    reentry_steering_enabled := true;
+                    reentry_final_display_active := false;
+                    reentry_terminated := false
+                  |}
+  | ReentryHuntest =>
+      if predicted_range_short_enough inputs then
+        {|
+          reentry_selector_state := ReentryUpControl;
+          reentry_kat_latched := reentry_kat_latched state;
+          reentry_roll_command_active := true;
+          reentry_lateral_switch_inhibited :=
+            reentry_lateral_switch_inhibited state;
+          reentry_kepler_trim_active := false;
+          reentry_steering_enabled := true;
+          reentry_final_display_active := false;
+          reentry_terminated := false
+        |}
+      else
+        {|
+          reentry_selector_state := ReentryHuntest;
+          reentry_kat_latched := reentry_kat_latched state;
+          reentry_roll_command_active := true;
+          reentry_lateral_switch_inhibited :=
+            reentry_lateral_switch_inhibited state;
+          reentry_kepler_trim_active := false;
+          reentry_steering_enabled := true;
+          reentry_final_display_active := false;
+          reentry_terminated := false
+        |}
+  | ReentryUpControl =>
+      let next_lateral_switch_inhibited :=
+        reentry_lateral_switch_inhibited state
+        || drag_above_lateral_threshold_now inputs in
+      if drag_below_q7_now inputs then
+        {|
+          reentry_selector_state := ReentryKep2;
+          reentry_kat_latched := reentry_kat_latched state;
+          reentry_roll_command_active := true;
+          reentry_lateral_switch_inhibited :=
+            next_lateral_switch_inhibited;
+          reentry_kepler_trim_active := true;
+          reentry_steering_enabled := true;
+          reentry_final_display_active := false;
+          reentry_terminated := false
+        |}
+      else if rdot_negative_now inputs
+              && reference_vl_exceeds_v_now inputs then
+             {|
+               reentry_selector_state := ReentryPredict3;
+               reentry_kat_latched := reentry_kat_latched state;
+               reentry_roll_command_active := true;
+               reentry_lateral_switch_inhibited :=
+                 next_lateral_switch_inhibited;
+               reentry_kepler_trim_active := false;
+               reentry_steering_enabled := true;
+               reentry_final_display_active := false;
+               reentry_terminated := false
+             |}
+           else
+             {|
+               reentry_selector_state := ReentryUpControl;
+               reentry_kat_latched := reentry_kat_latched state;
+               reentry_roll_command_active := true;
+               reentry_lateral_switch_inhibited :=
+                 next_lateral_switch_inhibited;
+               reentry_kepler_trim_active := false;
+               reentry_steering_enabled := true;
+               reentry_final_display_active := false;
+               reentry_terminated := false
+             |}
+  | ReentryKep2 =>
+      if drag_exceeds_q7_margin_now inputs then
+        {|
+          reentry_selector_state := ReentryPredict3;
+          reentry_kat_latched := reentry_kat_latched state;
+          reentry_roll_command_active := true;
+          reentry_lateral_switch_inhibited :=
+            reentry_lateral_switch_inhibited state;
+          reentry_kepler_trim_active := false;
+          reentry_steering_enabled := true;
+          reentry_final_display_active := false;
+          reentry_terminated := false
+        |}
+      else
+        {|
+          reentry_selector_state := ReentryKep2;
+          reentry_kat_latched := reentry_kat_latched state;
+          reentry_roll_command_active := reentry_roll_command_active state;
+          reentry_lateral_switch_inhibited :=
+            reentry_lateral_switch_inhibited state;
+          reentry_kepler_trim_active := true;
+          reentry_steering_enabled := true;
+          reentry_final_display_active := false;
+          reentry_terminated := false
+        |}
+  | ReentryPredict3 =>
+      if velocity_below_vquit_now inputs then
+        {|
+          reentry_selector_state := ReentryP67_1;
+          reentry_kat_latched := reentry_kat_latched state;
+          reentry_roll_command_active := true;
+          reentry_lateral_switch_inhibited :=
+            reentry_lateral_switch_inhibited state;
+          reentry_kepler_trim_active := false;
+          reentry_steering_enabled := false;
+          reentry_final_display_active := true;
+          reentry_terminated := false
+        |}
+      else
+        {|
+          reentry_selector_state := ReentryPredict3;
+          reentry_kat_latched := reentry_kat_latched state;
+          reentry_roll_command_active := true;
+          reentry_lateral_switch_inhibited :=
+            reentry_lateral_switch_inhibited state;
+          reentry_kepler_trim_active := false;
+          reentry_steering_enabled := true;
+          reentry_final_display_active := false;
+          reentry_terminated := false
+        |}
+  | ReentryP67_1 =>
+      if final_display_acknowledged_now inputs then
+        {|
+          reentry_selector_state := ReentryP67_1;
+          reentry_kat_latched := reentry_kat_latched state;
+          reentry_roll_command_active := true;
+          reentry_lateral_switch_inhibited :=
+            reentry_lateral_switch_inhibited state;
+          reentry_kepler_trim_active := false;
+          reentry_steering_enabled := false;
+          reentry_final_display_active := false;
+          reentry_terminated := true
+        |}
+      else
+        {|
+          reentry_selector_state := ReentryP67_1;
+          reentry_kat_latched := reentry_kat_latched state;
+          reentry_roll_command_active := true;
+          reentry_lateral_switch_inhibited :=
+            reentry_lateral_switch_inhibited state;
+          reentry_kepler_trim_active := false;
+          reentry_steering_enabled := false;
+          reentry_final_display_active := true;
+          reentry_terminated := false
+        |}
+  end.
+
+(**
+  This invariant says the control state is internally coherent with the phase
+  structure described by `REENTRY_CONTROL.agc`.
+*)
+Definition reentry_control_state_ok (state : reentry_control_state) : Prop :=
+  (reentry_final_display_active state = true ->
+     reentry_selector_state state = ReentryP67_1) /\
+  (reentry_terminated state = true ->
+     reentry_selector_state state = ReentryP67_1 /\
+     reentry_steering_enabled state = false) /\
+  (reentry_kepler_trim_active state = true ->
+     reentry_selector_state state = ReentryKep2).
+
+(** The initial reentry selector is coherent. *)
+Lemma initial_reentry_control_state_ok :
+  reentry_control_state_ok initial_reentry_control_state.
+Proof.
+  unfold reentry_control_state_ok, initial_reentry_control_state.
+  simpl.
+  repeat split; congruence.
+Qed.
+
+(**
+  Crossing the first `INITROLL` threshold latches the `KAT` milestone without
+  yet leaving `INITROLL`.
+*)
+Lemma initroll_kat_threshold_latches_without_phase_advance :
+  forall (inputs : reentry_control_inputs) (state : reentry_control_state),
+    reentry_selector_state state = ReentryInitRoll ->
+    reentry_kat_latched state = false ->
+    direct_kepler_entry_now inputs = false ->
+    kat_exceeded_now inputs = true ->
+    reentry_selector_state (apply_reentry_control_step inputs state)
+      = ReentryInitRoll /\
+    reentry_kat_latched (apply_reentry_control_step inputs state) = true.
+Proof.
+  intros inputs state Hsel Hkat Hdirect Hnow.
+  unfold apply_reentry_control_step.
+  rewrite Hsel.
+  rewrite Hdirect.
+  rewrite Hkat.
+  rewrite Hnow.
+  split; reflexivity.
+Qed.
+
+(**
+  After `KAT` has been latched, exceeding the second threshold advances to
+  `HUNTEST`.
+*)
+Lemma initroll_vrthresh_advances_to_huntest :
+  forall (inputs : reentry_control_inputs) (state : reentry_control_state),
+    reentry_selector_state state = ReentryInitRoll ->
+    reentry_kat_latched state = true ->
+    direct_kepler_entry_now inputs = false ->
+    vrthresh_exceeded_now inputs = true ->
+    reentry_selector_state (apply_reentry_control_step inputs state)
+      = ReentryHuntest.
+Proof.
+  intros inputs state Hsel Hkat Hdirect Hvr.
+  unfold apply_reentry_control_step.
+  rewrite Hsel.
+  rewrite Hdirect.
+  rewrite Hkat.
+  rewrite Hvr.
+  reflexivity.
+Qed.
+
+(**
+  The source's pre-`.05G` path can bypass `HUNTEST` entirely and jump straight
+  into `KEP2`.
+*)
+Lemma initroll_direct_kepler_entry_bypasses_huntest :
+  forall (inputs : reentry_control_inputs) (state : reentry_control_state),
+    reentry_selector_state state = ReentryInitRoll ->
+    direct_kepler_entry_now inputs = true ->
+    reentry_selector_state (apply_reentry_control_step inputs state)
+      = ReentryKep2 /\
+    reentry_kepler_trim_active (apply_reentry_control_step inputs state)
+      = true.
+Proof.
+  intros inputs state Hsel Hdirect.
+  unfold apply_reentry_control_step.
+  rewrite Hsel.
+  rewrite Hdirect.
+  split; reflexivity.
+Qed.
+
+(**
+  A successful hunt test transfers control to the super-circular phase.
+*)
+Lemma huntest_success_enters_upcontrol :
+  forall (inputs : reentry_control_inputs) (state : reentry_control_state),
+    reentry_selector_state state = ReentryHuntest ->
+    predicted_range_short_enough inputs = true ->
+    reentry_selector_state (apply_reentry_control_step inputs state)
+      = ReentryUpControl.
+Proof.
+  intros inputs state Hsel Hrange.
+  unfold apply_reentry_control_step.
+  rewrite Hsel.
+  rewrite Hrange.
+  reflexivity.
+Qed.
+
+(**
+  Falling below `Q7` during `UPCONTRL` transfers into the Kepler phase.
+*)
+Lemma upcontrol_drag_drop_enters_kep2 :
+  forall (inputs : reentry_control_inputs) (state : reentry_control_state),
+    reentry_selector_state state = ReentryUpControl ->
+    drag_below_q7_now inputs = true ->
+    reentry_selector_state (apply_reentry_control_step inputs state)
+      = ReentryKep2 /\
+    reentry_kepler_trim_active (apply_reentry_control_step inputs state)
+      = true.
+Proof.
+  intros inputs state Hsel Hdrag.
+  unfold apply_reentry_control_step.
+  rewrite Hsel.
+  rewrite Hdrag.
+  split; reflexivity.
+Qed.
+
+(**
+  The alternate `UPCONTRL` exit skips Kepler entirely when `RDOT` is negative
+  and the reference `VL` exceeds the current velocity.
+*)
+Lemma upcontrol_skip_kepler_enters_predict3 :
+  forall (inputs : reentry_control_inputs) (state : reentry_control_state),
+    reentry_selector_state state = ReentryUpControl ->
+    drag_below_q7_now inputs = false ->
+    rdot_negative_now inputs = true ->
+    reference_vl_exceeds_v_now inputs = true ->
+    reentry_selector_state (apply_reentry_control_step inputs state)
+      = ReentryPredict3.
+Proof.
+  intros inputs state Hsel Hdrag Hrdot Hvl.
+  unfold apply_reentry_control_step.
+  rewrite Hsel.
+  rewrite Hdrag.
+  rewrite Hrdot.
+  rewrite Hvl.
+  reflexivity.
+Qed.
+
+(**
+  Once the Kepler drag threshold is exceeded, the controller enters the final
+  predictive steering phase.
+*)
+Lemma kep2_drag_margin_enters_predict3 :
+  forall (inputs : reentry_control_inputs) (state : reentry_control_state),
+    reentry_selector_state state = ReentryKep2 ->
+    drag_exceeds_q7_margin_now inputs = true ->
+    reentry_selector_state (apply_reentry_control_step inputs state)
+      = ReentryPredict3.
+Proof.
+  intros inputs state Hsel Hdrag.
+  unfold apply_reentry_control_step.
+  rewrite Hsel.
+  rewrite Hdrag.
+  reflexivity.
+Qed.
+
+(**
+  Dropping below `VQUIT` disables steering and activates the final display.
+*)
+Lemma predict3_vquit_enters_p67_1 :
+  forall (inputs : reentry_control_inputs) (state : reentry_control_state),
+    reentry_selector_state state = ReentryPredict3 ->
+    velocity_below_vquit_now inputs = true ->
+    reentry_selector_state (apply_reentry_control_step inputs state)
+      = ReentryP67_1 /\
+    reentry_steering_enabled (apply_reentry_control_step inputs state)
+      = false /\
+    reentry_final_display_active (apply_reentry_control_step inputs state)
+      = true.
+Proof.
+  intros inputs state Hsel Hvquit.
+  unfold apply_reentry_control_step.
+  rewrite Hsel.
+  rewrite Hvquit.
+  repeat split; reflexivity.
+Qed.
+
+(**
+  Acknowledging the final flashing display terminates the reentry sequence.
+*)
+Lemma p67_1_acknowledgement_terminates_entry :
+  forall (inputs : reentry_control_inputs) (state : reentry_control_state),
+    reentry_selector_state state = ReentryP67_1 ->
+    final_display_acknowledged_now inputs = true ->
+    reentry_terminated (apply_reentry_control_step inputs state) = true /\
+    reentry_final_display_active (apply_reentry_control_step inputs state)
+      = false.
+Proof.
+  intros inputs state Hsel Hack.
+  unfold apply_reentry_control_step.
+  rewrite Hsel.
+  rewrite Hack.
+  split; reflexivity.
+Qed.
+
+(**
+  The selector rank never decreases.  Reentry may stall in place for several
+  control cycles, but it never jumps backward in this abstraction.
+*)
+Lemma reentry_selector_rank_monotone :
+  forall (inputs : reentry_control_inputs) (state : reentry_control_state),
+    reentry_selector_rank (reentry_selector_state state) <=
+    reentry_selector_rank
+      (reentry_selector_state (apply_reentry_control_step inputs state)).
+Proof.
+  intros inputs state.
+  unfold apply_reentry_control_step, reentry_selector_rank.
+  destruct (reentry_selector_state state); simpl.
+  - destruct (direct_kepler_entry_now inputs),
+      (reentry_kat_latched state),
+      (vrthresh_exceeded_now inputs),
+      (kat_exceeded_now inputs); simpl; lia.
+  - destruct (predicted_range_short_enough inputs); simpl; lia.
+  - destruct (drag_below_q7_now inputs),
+      (rdot_negative_now inputs),
+      (reference_vl_exceeds_v_now inputs); simpl; lia.
+  - destruct (drag_exceeds_q7_margin_now inputs); simpl; lia.
+  - destruct (velocity_below_vquit_now inputs); simpl; lia.
+  - destruct (final_display_acknowledged_now inputs); simpl; lia.
+Qed.
+
+(**
+  Each control step preserves the internal reentry consistency invariant.
+*)
+Lemma apply_reentry_control_step_preserves_ok :
+  forall (inputs : reentry_control_inputs) (state : reentry_control_state),
+    reentry_control_state_ok state ->
+    reentry_control_state_ok (apply_reentry_control_step inputs state).
+Proof.
+  intros inputs state _.
+  unfold reentry_control_state_ok, apply_reentry_control_step.
+  destruct (reentry_selector_state state); simpl.
+  - destruct (direct_kepler_entry_now inputs),
+      (reentry_kat_latched state),
+      (vrthresh_exceeded_now inputs),
+      (kat_exceeded_now inputs); simpl; repeat split; congruence.
+  - destruct (predicted_range_short_enough inputs); simpl;
+      repeat split; congruence.
+  - destruct (drag_below_q7_now inputs),
+      (rdot_negative_now inputs),
+      (reference_vl_exceeds_v_now inputs); simpl;
+      repeat split; congruence.
+  - destruct (drag_exceeds_q7_margin_now inputs); simpl;
+      repeat split; congruence.
+  - destruct (velocity_below_vquit_now inputs); simpl;
+      repeat split; congruence.
+  - destruct (final_display_acknowledged_now inputs); simpl;
+      repeat split; congruence.
+Qed.
+
+(** * Composed CM Entry State *)
+
+(**
+  The Command Module entry stack couples the entry DAP with the reentry
+  selector logic.  This composed state keeps the two control kernels together
+  and reflects whether the spacecraft is still in entry or has completed the
+  final flashing display interaction.
+*)
+Record cm_entry_state : Type := {
+  cm_entry_dap_control : cm_dap_state;
+  cm_entry_reentry_control : reentry_control_state;
+  cm_entry_mission_phase : mission_phase
+}.
+
+(** The composed initial CM entry state starts in the `Entry` mission phase. *)
+Definition initial_cm_entry_state : cm_entry_state :=
+  {|
+    cm_entry_dap_control := initial_cm_dap_state;
+    cm_entry_reentry_control := initial_reentry_control_state;
+    cm_entry_mission_phase := Entry
+  |}.
+
+(**
+  One CM entry cycle advances both the DAP control logic and the reentry
+  selector logic.  Mission phase flips to `SplashdownRecovery` exactly when
+  reentry termination has been acknowledged.
+*)
+Definition apply_cm_entry_cycle
+    (dap_inputs : cm_dap_inputs)
+    (reentry_inputs : reentry_control_inputs)
+    (state : cm_entry_state)
+    : cm_entry_state :=
+  let next_dap :=
+    apply_cm_dap_step dap_inputs (cm_entry_dap_control state) in
+  let next_reentry :=
+    apply_reentry_control_step reentry_inputs
+      (cm_entry_reentry_control state) in
+  {|
+    cm_entry_dap_control := next_dap;
+    cm_entry_reentry_control := next_reentry;
+    cm_entry_mission_phase :=
+      if reentry_terminated next_reentry
+      then SplashdownRecovery
+      else Entry
+  |}.
+
+(**
+  The composed CM entry state is coherent when:
+
+  - the reentry controller is itself coherent
+  - the mission phase agrees with reentry termination
+  - the selected mission phase is legal for `Comanche055`
+*)
+Definition cm_entry_state_ok (state : cm_entry_state) : Prop :=
+  reentry_control_state_ok (cm_entry_reentry_control state) /\
+  cm_entry_mission_phase state =
+    (if reentry_terminated (cm_entry_reentry_control state)
+     then SplashdownRecovery
+     else Entry) /\
+  program_supports_phase Comanche055 (cm_entry_mission_phase state) = true.
+
+(** The initial composed entry state is well-formed. *)
+Lemma initial_cm_entry_state_ok :
+  cm_entry_state_ok initial_cm_entry_state.
+Proof.
+  unfold cm_entry_state_ok, initial_cm_entry_state.
+  simpl.
+  split.
+  - apply initial_reentry_control_state_ok.
+  - split; reflexivity.
+Qed.
+
+(**
+  Updating the composed CM entry state preserves its mission-level coherence.
+*)
+Lemma apply_cm_entry_cycle_preserves_ok :
+  forall
+    (dap_inputs : cm_dap_inputs)
+    (reentry_inputs : reentry_control_inputs)
+    (state : cm_entry_state),
+    cm_entry_state_ok state ->
+    cm_entry_state_ok
+      (apply_cm_entry_cycle dap_inputs reentry_inputs state).
+Proof.
+  intros dap_inputs reentry_inputs state [Hreentry [Hphase Hsupported]].
+  unfold cm_entry_state_ok, apply_cm_entry_cycle.
+  simpl.
+  split.
+  - apply apply_reentry_control_step_preserves_ok.
+    exact Hreentry.
+  - split.
+    + destruct
+        (reentry_terminated
+           (apply_reentry_control_step reentry_inputs
+              (cm_entry_reentry_control state))); reflexivity.
+    + destruct
+        (reentry_terminated
+           (apply_reentry_control_step reentry_inputs
+              (cm_entry_reentry_control state))); reflexivity.
+Qed.
+
+(**
+  Terminating the reentry selector promotes the composed mission phase to
+  `SplashdownRecovery`.
+*)
+Lemma terminated_cm_entry_cycle_reaches_splashdown :
+  forall
+    (dap_inputs : cm_dap_inputs)
+    (reentry_inputs : reentry_control_inputs)
+    (state : cm_entry_state),
+    reentry_terminated
+      (apply_reentry_control_step reentry_inputs
+         (cm_entry_reentry_control state)) = true ->
+    cm_entry_mission_phase
+      (apply_cm_entry_cycle dap_inputs reentry_inputs state)
+      = SplashdownRecovery.
+Proof.
+  intros dap_inputs reentry_inputs state Hterm.
+  unfold apply_cm_entry_cycle.
+  simpl.
+  rewrite Hterm.
+  reflexivity.
+Qed.
+
+(**
+  Before reentry termination, the composed CM state remains in the entry phase.
+*)
+Lemma unterminated_cm_entry_cycle_remains_in_entry :
+  forall
+    (dap_inputs : cm_dap_inputs)
+    (reentry_inputs : reentry_control_inputs)
+    (state : cm_entry_state),
+    reentry_terminated
+      (apply_reentry_control_step reentry_inputs
+         (cm_entry_reentry_control state)) = false ->
+    cm_entry_mission_phase
+      (apply_cm_entry_cycle dap_inputs reentry_inputs state)
+      = Entry.
+Proof.
+  intros dap_inputs reentry_inputs state Hterm.
+  unfold apply_cm_entry_cycle.
+  simpl.
+  rewrite Hterm.
+  reflexivity.
+Qed.
+
+(**
+  Entering `P67.1` in the reentry controller necessarily leaves the composed
+  mission phase at `Entry`, because the final display must still be
+  acknowledged before recovery begins.
+*)
+Lemma p67_1_display_keeps_cm_in_entry_phase :
+  forall
+    (dap_inputs : cm_dap_inputs)
+    (reentry_inputs : reentry_control_inputs)
+    (state : cm_entry_state),
+    reentry_selector_state
+      (apply_reentry_control_step reentry_inputs
+         (cm_entry_reentry_control state)) = ReentryP67_1 ->
+    reentry_terminated
+      (apply_reentry_control_step reentry_inputs
+         (cm_entry_reentry_control state)) = false ->
+    cm_entry_mission_phase
+      (apply_cm_entry_cycle dap_inputs reentry_inputs state)
+      = Entry.
+Proof.
+  intros dap_inputs reentry_inputs state _ Hterm.
+  apply unterminated_cm_entry_cycle_remains_in_entry.
+  exact Hterm.
+Qed.
+
+(** * Executable CM Entry Traces *)
+
+(**
+  To make the reentry model operational rather than merely local, we package
+  one control-cycle worth of DAP inputs together with one control-cycle worth
+  of reentry-selector inputs.
+*)
+Record cm_entry_cycle_inputs : Type := {
+  cycle_dap_inputs : cm_dap_inputs;
+  cycle_reentry_inputs : reentry_control_inputs
+}.
+
+(** One cycle applies both kernels to the composed CM entry state. *)
+Definition apply_cm_entry_trace_step
+    (cycle : cm_entry_cycle_inputs) (state : cm_entry_state)
+    : cm_entry_state :=
+  apply_cm_entry_cycle
+    (cycle_dap_inputs cycle)
+    (cycle_reentry_inputs cycle)
+    state.
+
+(**
+  A finite control trace is executed left-to-right.  This gives us a concrete,
+  executable notion of Apollo entry scenarios that can be used in later
+  refinement and validation proofs.
+*)
+Fixpoint run_cm_entry_trace
+    (trace : list cm_entry_cycle_inputs) (state : cm_entry_state)
+    : cm_entry_state :=
+  match trace with
+  | [] => state
+  | cycle :: rest =>
+      run_cm_entry_trace rest (apply_cm_entry_trace_step cycle state)
+  end.
+
+(** DAP inputs for the first armed pass, before body-rate validity is set. *)
+Definition cm_dap_first_pass_inputs : cm_dap_inputs :=
+  {|
+    cm_dstby_enabled := true;
+    cm_gymdifsw_enabled := false;
+    cdu_in_fine_align := false
+  |}.
+
+(** DAP inputs for normal operational body-rate computation. *)
+Definition cm_dap_operational_inputs : cm_dap_inputs :=
+  {|
+    cm_dstby_enabled := true;
+    cm_gymdifsw_enabled := true;
+    cdu_in_fine_align := false
+  |}.
+
+(** DAP inputs that terminate the active entry DAP path. *)
+Definition cm_dap_termination_inputs : cm_dap_inputs :=
+  {|
+    cm_dstby_enabled := false;
+    cm_gymdifsw_enabled := true;
+    cdu_in_fine_align := false
+  |}.
+
+(** `INITROLL` input that latches the first threshold. *)
+Definition reentry_kat_latch_inputs : reentry_control_inputs :=
+  {|
+    kat_exceeded_now := true;
+    vrthresh_exceeded_now := false;
+    direct_kepler_entry_now := false;
+    predicted_range_short_enough := false;
+    drag_above_lateral_threshold_now := false;
+    drag_below_q7_now := false;
+    rdot_negative_now := false;
+    reference_vl_exceeds_v_now := false;
+    drag_exceeds_q7_margin_now := false;
+    velocity_below_vquit_now := false;
+    final_display_acknowledged_now := false
+  |}.
+
+(** `INITROLL` input that advances from the latched state to `HUNTEST`. *)
+Definition reentry_vrthresh_inputs : reentry_control_inputs :=
+  {|
+    kat_exceeded_now := false;
+    vrthresh_exceeded_now := true;
+    direct_kepler_entry_now := false;
+    predicted_range_short_enough := false;
+    drag_above_lateral_threshold_now := false;
+    drag_below_q7_now := false;
+    rdot_negative_now := false;
+    reference_vl_exceeds_v_now := false;
+    drag_exceeds_q7_margin_now := false;
+    velocity_below_vquit_now := false;
+    final_display_acknowledged_now := false
+  |}.
+
+(** `HUNTEST` input that accepts the predicted range and enters `UPCONTRL`. *)
+Definition reentry_huntest_success_inputs : reentry_control_inputs :=
+  {|
+    kat_exceeded_now := false;
+    vrthresh_exceeded_now := false;
+    direct_kepler_entry_now := false;
+    predicted_range_short_enough := true;
+    drag_above_lateral_threshold_now := false;
+    drag_below_q7_now := false;
+    rdot_negative_now := false;
+    reference_vl_exceeds_v_now := false;
+    drag_exceeds_q7_margin_now := false;
+    velocity_below_vquit_now := false;
+    final_display_acknowledged_now := false
+  |}.
+
+(** `UPCONTRL` input that enters the Kepler phase when drag falls below `Q7`. *)
+Definition reentry_upcontrol_to_kep_inputs : reentry_control_inputs :=
+  {|
+    kat_exceeded_now := false;
+    vrthresh_exceeded_now := false;
+    direct_kepler_entry_now := false;
+    predicted_range_short_enough := false;
+    drag_above_lateral_threshold_now := true;
+    drag_below_q7_now := true;
+    rdot_negative_now := false;
+    reference_vl_exceeds_v_now := false;
+    drag_exceeds_q7_margin_now := false;
+    velocity_below_vquit_now := false;
+    final_display_acknowledged_now := false
+  |}.
+
+(** `UPCONTRL` input that skips Kepler and goes directly to `PREDICT3`. *)
+Definition reentry_upcontrol_skip_kepler_inputs : reentry_control_inputs :=
+  {|
+    kat_exceeded_now := false;
+    vrthresh_exceeded_now := false;
+    direct_kepler_entry_now := false;
+    predicted_range_short_enough := false;
+    drag_above_lateral_threshold_now := true;
+    drag_below_q7_now := false;
+    rdot_negative_now := true;
+    reference_vl_exceeds_v_now := true;
+    drag_exceeds_q7_margin_now := false;
+    velocity_below_vquit_now := false;
+    final_display_acknowledged_now := false
+  |}.
+
+(** `KEP2` input that advances into the final predictive phase. *)
+Definition reentry_kep2_to_predict_inputs : reentry_control_inputs :=
+  {|
+    kat_exceeded_now := false;
+    vrthresh_exceeded_now := false;
+    direct_kepler_entry_now := false;
+    predicted_range_short_enough := false;
+    drag_above_lateral_threshold_now := false;
+    drag_below_q7_now := false;
+    rdot_negative_now := false;
+    reference_vl_exceeds_v_now := false;
+    drag_exceeds_q7_margin_now := true;
+    velocity_below_vquit_now := false;
+    final_display_acknowledged_now := false
+  |}.
+
+(** `PREDICT3` input that drops below `VQUIT` and starts `P67.1`. *)
+Definition reentry_predict3_to_p67_inputs : reentry_control_inputs :=
+  {|
+    kat_exceeded_now := false;
+    vrthresh_exceeded_now := false;
+    direct_kepler_entry_now := false;
+    predicted_range_short_enough := false;
+    drag_above_lateral_threshold_now := false;
+    drag_below_q7_now := false;
+    rdot_negative_now := false;
+    reference_vl_exceeds_v_now := false;
+    drag_exceeds_q7_margin_now := false;
+    velocity_below_vquit_now := true;
+    final_display_acknowledged_now := false
+  |}.
+
+(** `P67.1` input that acknowledges the final flashing display. *)
+Definition reentry_p67_ack_inputs : reentry_control_inputs :=
+  {|
+    kat_exceeded_now := false;
+    vrthresh_exceeded_now := false;
+    direct_kepler_entry_now := false;
+    predicted_range_short_enough := false;
+    drag_above_lateral_threshold_now := false;
+    drag_below_q7_now := false;
+    rdot_negative_now := false;
+    reference_vl_exceeds_v_now := false;
+    drag_exceeds_q7_margin_now := false;
+    velocity_below_vquit_now := false;
+    final_display_acknowledged_now := true
+  |}.
+
+(**
+  This trace follows the commented nominal path:
+
+  `INITROLL -> HUNTEST -> UPCONTRL -> KEP2 -> PREDICT3 -> P67.1`, followed by
+  final display acknowledgement and DAP shutdown.
+*)
+Definition cm_nominal_reentry_trace : list cm_entry_cycle_inputs :=
+  [
+    {|
+      cycle_dap_inputs := cm_dap_first_pass_inputs;
+      cycle_reentry_inputs := reentry_kat_latch_inputs
+    |};
+    {|
+      cycle_dap_inputs := cm_dap_operational_inputs;
+      cycle_reentry_inputs := reentry_vrthresh_inputs
+    |};
+    {|
+      cycle_dap_inputs := cm_dap_operational_inputs;
+      cycle_reentry_inputs := reentry_huntest_success_inputs
+    |};
+    {|
+      cycle_dap_inputs := cm_dap_operational_inputs;
+      cycle_reentry_inputs := reentry_upcontrol_to_kep_inputs
+    |};
+    {|
+      cycle_dap_inputs := cm_dap_operational_inputs;
+      cycle_reentry_inputs := reentry_kep2_to_predict_inputs
+    |};
+    {|
+      cycle_dap_inputs := cm_dap_operational_inputs;
+      cycle_reentry_inputs := reentry_predict3_to_p67_inputs
+    |};
+    {|
+      cycle_dap_inputs := cm_dap_termination_inputs;
+      cycle_reentry_inputs := reentry_p67_ack_inputs
+    |}
+  ].
+
+(**
+  This trace exercises the alternate source-commented path that skips the
+  Kepler phase from `UPCONTRL`.
+*)
+Definition cm_skip_kepler_trace : list cm_entry_cycle_inputs :=
+  [
+    {|
+      cycle_dap_inputs := cm_dap_first_pass_inputs;
+      cycle_reentry_inputs := reentry_kat_latch_inputs
+    |};
+    {|
+      cycle_dap_inputs := cm_dap_operational_inputs;
+      cycle_reentry_inputs := reentry_vrthresh_inputs
+    |};
+    {|
+      cycle_dap_inputs := cm_dap_operational_inputs;
+      cycle_reentry_inputs := reentry_huntest_success_inputs
+    |};
+    {|
+      cycle_dap_inputs := cm_dap_operational_inputs;
+      cycle_reentry_inputs := reentry_upcontrol_skip_kepler_inputs
+    |};
+    {|
+      cycle_dap_inputs := cm_dap_operational_inputs;
+      cycle_reentry_inputs := reentry_predict3_to_p67_inputs
+    |}
+  ].
+
+(**
+  Executing the nominal reentry trace reaches `SplashdownRecovery`, leaves the
+  selector in `P67.1`, and shuts the DAP down.
+*)
+Lemma cm_nominal_reentry_trace_reaches_splashdown :
+  let final_state :=
+    run_cm_entry_trace cm_nominal_reentry_trace initial_cm_entry_state in
+  cm_entry_mission_phase final_state = SplashdownRecovery /\
+  reentry_selector_state (cm_entry_reentry_control final_state)
+    = ReentryP67_1 /\
+  reentry_terminated (cm_entry_reentry_control final_state) = true /\
+  cm_dap_armed (cm_entry_dap_control final_state) = false /\
+  cm_body_rate_valid (cm_entry_dap_control final_state) = false.
+Proof.
+  vm_compute.
+  repeat split; reflexivity.
+Qed.
+
+(**
+  Executing the skip-Kepler trace reaches `P67.1` while remaining in the `Entry`
+  mission phase because the final display has not yet been acknowledged.
+*)
+Lemma cm_skip_kepler_trace_reaches_p67_1_without_termination :
+  let final_state :=
+    run_cm_entry_trace cm_skip_kepler_trace initial_cm_entry_state in
+  cm_entry_mission_phase final_state = Entry /\
+  reentry_selector_state (cm_entry_reentry_control final_state)
+    = ReentryP67_1 /\
+  reentry_terminated (cm_entry_reentry_control final_state) = false /\
+  reentry_final_display_active (cm_entry_reentry_control final_state) = true /\
+  cm_body_rate_valid (cm_entry_dap_control final_state) = true.
+Proof.
+  vm_compute.
+  repeat split; reflexivity.
+Qed.
