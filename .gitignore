@@ -9,3 +9,6 @@
 # Native compilation artifacts.
 .coq-native/
 lia.cache
+
+# Local browser automation artifacts.
+.playwright-cli/
